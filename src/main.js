@@ -1,0 +1,864 @@
+import { exportVolume, FORMATS, saveText, sinkGzip } from "./export/export.js";
+import { rawSize } from "./export/formats.js";
+import { buildTree, ITKSNAP_MAX_LABEL, toItkSnap, toSlicerCtbl, toStructuresJson } from "./export/ontology.js";
+import { canStreamToDisk, openSink } from "./export/sink.js";
+import { componentUrls, DEFAULT_NEUROGLANCER, stateFileUrl, viewerUrl } from "./neuroglancer.js";
+import { buildSearchIndex, commonName, compareAtlases, facetCounts, formatResolution, minResolution, search } from "./search.js";
+
+const app = document.getElementById("app");
+const jobsEl = document.getElementById("jobs");
+
+let INDEX = null;
+let DOCS = null;
+const BY_KEY = new Map(); // "allen_mouse_25um" -> atlas entry (one resolution)
+const BY_NAME = new Map(); // "allen_mouse" -> {name, family, keys: [atlas entries, finest first]}
+const TERM_CACHE = new Map();
+
+const state = {
+  q: "",
+  facets: { species: new Set(), resMin: null, resMax: null },
+  expanded: new Set(),
+};
+
+// ---------------------------------------------------------------------------
+// utilities
+// ---------------------------------------------------------------------------
+const esc = (s) =>
+  String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+function h(html) {
+  const t = document.createElement("template");
+  t.innerHTML = html.trim();
+  return t.content.firstElementChild;
+}
+
+export function formatBytes(n) {
+  if (!Number.isFinite(n)) return "?";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1000 && i < u.length - 1) {
+    n /= 1000;
+    i++;
+  }
+  return `${n < 10 && i ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
+}
+
+function linkify(text) {
+  return esc(text).replace(/(https?:\/\/[^\s,;)]+)/g, '<a href="$1">$1</a>');
+}
+
+function highlight(text, terms) {
+  let out = esc(text);
+  for (const t of terms) {
+    if (t.length < 2) continue;
+    const re = new RegExp(`(${esc(t).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "ig");
+    out = out.replace(re, "<mark>$1</mark>");
+  }
+  return out;
+}
+
+let toastTimer;
+function toast(msg) {
+  let el = document.querySelector(".toast");
+  if (!el) {
+    el = h('<div class="toast" role="status"></div>');
+    document.body.append(el);
+  }
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 2200);
+}
+
+async function copy(text, what = "Copied") {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`${what} to clipboard`);
+  } catch {
+    toast("Copy failed: the browser blocked clipboard access");
+  }
+}
+
+function familyOf(a) {
+  return a.docs?.title || a.name;
+}
+
+const pageHref = (name) => `#/atlas/${encodeURIComponent(name)}`;
+
+function storageGet(k) {
+  try {
+    return localStorage.getItem(k);
+  } catch {
+    return null;
+  }
+}
+function storageSet(k, v) {
+  try {
+    if (v == null) localStorage.removeItem(k);
+    else localStorage.setItem(k, v);
+  } catch {
+    /* ignore */
+  }
+}
+
+const ngBase = () => storageGet("ngBase") || DEFAULT_NEUROGLANCER;
+
+async function loadTerminology(atlas) {
+  const t = INDEX.terminologies[atlas.terminology.location];
+  if (!t) return null;
+  if (!TERM_CACHE.has(t.file)) {
+    TERM_CACHE.set(
+      t.file,
+      fetch(`data/${t.file}`).then((r) => (r.ok ? r.json() : null)),
+    );
+  }
+  return TERM_CACHE.get(t.file);
+}
+
+// ---------------------------------------------------------------------------
+// theme (system / light / dark), as on brainglobe.info
+// ---------------------------------------------------------------------------
+function setupThemeToggle() {
+  const btn = document.getElementById("theme-toggle");
+  const order = ["system", "light", "dark"];
+  const apply = (mode) => {
+    if (mode === "system") delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = mode;
+    btn.dataset.mode = mode;
+    btn.title = `Theme: ${mode} (click to change)`;
+    btn.setAttribute("aria-label", btn.title);
+  };
+  apply(storageGet("theme") || "system");
+  btn.addEventListener("click", () => {
+    const next = order[(order.indexOf(btn.dataset.mode) + 1) % order.length];
+    storageSet("theme", next === "system" ? null : next);
+    apply(next);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// routing
+// ---------------------------------------------------------------------------
+function route() {
+  const m = /^#\/atlas\/(.+)$/.exec(location.hash);
+  if (m) {
+    const id = decodeURIComponent(m[1]);
+    if (BY_NAME.has(id)) return renderDetail(BY_NAME.get(id));
+    // old per-resolution links: show the atlas page with that resolution selected
+    // a resolution-specific atlas name selects that resolution on the atlas page
+    const atlas = BY_KEY.get(id);
+    if (atlas) return renderDetail(BY_NAME.get(atlas.name), atlas);
+  }
+  renderSearch();
+}
+
+window.addEventListener("hashchange", () => {
+  route();
+  window.scrollTo(0, 0);
+});
+
+// ---------------------------------------------------------------------------
+// search view
+// ---------------------------------------------------------------------------
+const SYNTAX = [
+  ["allen mouse", "atlases matching every word"],
+  ['"light sheet"', "exact phrase"],
+  ["region:CA1", "atlases whose ontology contains a region (name or acronym)"],
+  ["res:<=25, res:10-50", "available at a resolution, in µm"],
+  ["species:rattus", "field filter; also name, citation, orientation"],
+  ["sym:no", "asymmetric atlases only"],
+];
+
+let searchView = null;
+
+function renderSearch() {
+  document.title = "Atlas search · BrainGlobe";
+  if (!searchView) {
+    searchView = h(`
+      <div class="with-sidebar">
+        <aside class="sidebar" id="facets" aria-label="Filters"></aside>
+        <div class="content">
+          <h1>Atlas search</h1>
+          <p>Search the ${BY_NAME.size} atlases, in ${new Set([...BY_NAME.values()].map((p) => p.family)).size} collections, available through the
+            <a href="https://brainglobe.info/documentation/brainglobe-atlasapi/index.html">BrainGlobe Atlas API</a>
+            by name, species, resolution, publication or brain region. Each atlas can be viewed in neuroglancer,
+            and its template, annotation, hemisphere map and ontology downloaded separately.</p>
+          <div class="searchbar">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <input id="q" type="search" autocomplete="off" spellcheck="false"
+              placeholder="Search atlases" aria-label="Search atlases" />
+          </div>
+          <details class="syntax"><summary>Search syntax</summary>
+            <table>${SYNTAX.map(([q, d]) => `<tr><td><code>${esc(q)}</code></td><td>${esc(d)}</td></tr>`).join("")}</table>
+          </details>
+          <p class="result-meta" id="result-meta"></p>
+          <div id="results"></div>
+        </div>
+      </div>`);
+    setupFacets();
+    const input = searchView.querySelector("#q");
+    input.value = state.q;
+    let timer;
+    input.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        state.q = input.value;
+        syncUrl();
+        updateResults();
+      }, 120);
+    });
+  }
+  app.replaceChildren(searchView);
+  updateResults();
+  const input = searchView.querySelector("#q");
+  if (document.activeElement === document.body) input.focus({ preventScroll: true });
+}
+
+function syncUrl() {
+  const u = new URL(location.href);
+  if (state.q) u.searchParams.set("q", state.q);
+  else u.searchParams.delete("q");
+  history.replaceState(null, "", u);
+}
+
+/** Collapse per-resolution results into one result per atlas name. */
+function byName(results) {
+  const out = new Map();
+  for (const r of results) {
+    const n = r.atlas.name;
+    const e = out.get(n);
+    if (!e) out.set(n, { ...r, atlas: BY_NAME.get(n).keys[0], regionMatches: [...r.regionMatches] });
+    else for (const x of r.regionMatches) if (!e.regionMatches.includes(x)) e.regionMatches.push(x);
+  }
+  return [...out.values()];
+}
+
+function updateResults() {
+  const results = byName(search(DOCS, state.q, state.facets));
+  updateFacets();
+
+  // group atlases by documentation family, preserving the rank of the best member
+  const families = new Map();
+  for (const r of results) {
+    const fam = familyOf(r.atlas);
+    if (!families.has(fam)) families.set(fam, { name: fam, items: [], regionMatches: new Set() });
+    const f = families.get(fam);
+    f.items.push(r);
+    r.regionMatches.forEach((x) => f.regionMatches.add(x));
+  }
+  const n = results.length;
+  const c = families.size;
+  searchView.querySelector("#result-meta").textContent = `${n} atlas${n === 1 ? "" : "es"} in ${c} collection${c === 1 ? "" : "s"}`;
+
+  const terms = (state.q.match(/"[^"]+"|\S+/g) || []).filter((t) => !t.includes(":")).map((t) => t.replace(/"/g, ""));
+  const list = searchView.querySelector("#results");
+  if (!n) {
+    list.innerHTML = `<p class="muted">No atlases match. Try fewer words or clear the filters.</p>`;
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const fam of families.values()) frag.append(familyEntry(fam, terms));
+  list.replaceChildren(frag);
+}
+
+const byNameNumeric = (a, b) => a.localeCompare(b, undefined, { numeric: true });
+
+function resolutionsText(page) {
+  return page.keys.map((a) => formatResolution(a).replace(" µm", "")).join(", ") + " µm";
+}
+
+function familyEntry(fam, terms) {
+  const first = fam.items[0].atlas;
+  const d = first.docs || {};
+  const names = fam.items.map((r) => r.atlas.name).sort(byNameNumeric);
+  const LIMIT = 12;
+  const expanded = state.expanded.has(fam.name);
+  const shown = expanded ? names : names.slice(0, LIMIT);
+  const regions = [...fam.regionMatches].slice(0, 6);
+  const common = commonName(first.species);
+  const summary = d.description ? d.description.split("\n\n")[0] : first.citation || "";
+  const single = names.length === 1 ? BY_NAME.get(names[0]) : null;
+  const el = h(`
+    <article class="result">
+      <h2><a href="${pageHref(names[0])}">${highlight(fam.name, terms)}</a></h2>
+      <p class="species">${common ? `${esc(common)} · ` : ""}<em>${highlight(first.species || "", terms)}</em>
+        ${single ? ` · ${esc(resolutionsText(single))}` : ""}</p>
+      <p class="summary">${highlight(summary, terms)}</p>
+      ${single ? "" : `<p class="keys">${shown
+        .map((nm) => `<a href="${pageHref(nm)}"><code>${highlight(nm, terms)}</code></a>`)
+        .join(" ")}
+        ${names.length > LIMIT ? `<button class="link-button" type="button">${expanded ? "show fewer" : `${names.length - LIMIT} more`}</button>` : ""}</p>`}
+      ${regions.length ? `<p class="regions-hit">Matching regions: ${regions.map((r) => {
+        const [acr, name] = r.split("\t");
+        return `${highlight(name, terms)} (<code>${esc(acr)}</code>)`;
+      }).join(", ")}</p>` : ""}
+    </article>`);
+  el.querySelector(".link-button")?.addEventListener("click", () => {
+    if (expanded) state.expanded.delete(fam.name);
+    else state.expanded.add(fam.name);
+    updateResults();
+  });
+  return el;
+}
+
+// Distinct resolutions (finest axis, µm) across all atlases; the stops of the resolution slider.
+let RES_VALUES = [];
+let SPECIES_ORDER = []; // all species, most atlases first
+const KEY_RES_INDEX = new Map(); // atlas key -> index into RES_VALUES
+
+function buildResolutionStops() {
+  const vals = [...new Set(INDEX.atlases.map((a) => minResolution(a)))].sort((a, b) => a - b);
+  RES_VALUES = vals.filter((v, i) => i === 0 || v - vals[i - 1] > 1e-6);
+  const perSpecies = facetCounts([...BY_NAME.values()].map((p) => ({ atlas: p.keys[0] }))).species;
+  SPECIES_ORDER = [...perSpecies.keys()].sort((a, b) => perSpecies.get(b) - perSpecies.get(a) || a.localeCompare(b));
+  for (const a of INDEX.atlases) {
+    const r = minResolution(a);
+    KEY_RES_INDEX.set(a.key, RES_VALUES.findIndex((v) => Math.abs(v - r) <= 1e-6));
+  }
+}
+
+const fmtRes = (v) => `${Number(v.toFixed(3))} µm`;
+
+let resSlider = null;
+
+/** Dual-handle resolution slider with a histogram of available atlases per resolution. */
+function createResSlider(onChange) {
+  const n = RES_VALUES.length;
+  const el = h(`
+    <div class="res-slider" style="--steps:${Math.max(1, n - 1)}">
+      <div class="histogram" aria-hidden="true">${RES_VALUES.map(() => "<span></span>").join("")}</div>
+      <div class="range">
+        <div class="track"></div><div class="fill"></div>
+        <input type="range" class="lo" min="0" max="${n - 1}" step="1" value="0" aria-label="Finest resolution" />
+        <input type="range" class="hi" min="0" max="${n - 1}" step="1" value="${n - 1}" aria-label="Coarsest resolution" />
+      </div>
+      <div class="range-values"><output class="lo-val"></output><output class="hi-val"></output></div>
+    </div>`);
+  const lo = el.querySelector(".lo");
+  const hi = el.querySelector(".hi");
+  const fill = el.querySelector(".fill");
+  const bars = [...el.querySelectorAll(".histogram span")];
+  const sync = () => {
+    const a = +lo.value;
+    const b = +hi.value;
+    fill.style.setProperty("--lo", a);
+    fill.style.setProperty("--hi", b);
+    // let the lower handle be grabbed when both sit at the top end
+    lo.style.zIndex = a > (n - 1) / 2 ? 3 : 1;
+    lo.setAttribute("aria-valuetext", fmtRes(RES_VALUES[a]));
+    hi.setAttribute("aria-valuetext", fmtRes(RES_VALUES[b]));
+    el.querySelector(".lo-val").textContent = fmtRes(RES_VALUES[a]);
+    el.querySelector(".hi-val").textContent = fmtRes(RES_VALUES[b]);
+    bars.forEach((s, i) => s.classList.toggle("in", i >= a && i <= b));
+  };
+  const commit = () => {
+    const a = +lo.value;
+    const b = +hi.value;
+    onChange(a === 0 ? null : RES_VALUES[a], b === n - 1 ? null : RES_VALUES[b]);
+  };
+  lo.addEventListener("input", () => {
+    if (+lo.value > +hi.value) lo.value = hi.value;
+    sync();
+    commit();
+  });
+  hi.addEventListener("input", () => {
+    if (+hi.value < +lo.value) hi.value = lo.value;
+    sync();
+    commit();
+  });
+  sync();
+  return {
+    el,
+    /** counts[i] = number of atlases available at RES_VALUES[i] */
+    setCounts(counts) {
+      const max = Math.max(1, ...counts);
+      bars.forEach((s, i) => {
+        // square-root scale so single atlases stay visible next to the 20/25 µm peaks
+        s.style.height = counts[i] ? `${Math.max(6, Math.sqrt(counts[i] / max) * 100)}%` : "0";
+        s.title = `${fmtRes(RES_VALUES[i])}: ${counts[i]} atlas${counts[i] === 1 ? "" : "es"}`;
+      });
+    },
+    set(min, max) {
+      lo.value = min == null ? 0 : Math.max(0, RES_VALUES.findIndex((v) => v >= min - 1e-6));
+      const j = max == null ? n - 1 : RES_VALUES.findLastIndex((v) => v <= max + 1e-6);
+      hi.value = j < 0 ? n - 1 : j;
+      sync();
+    },
+  };
+}
+
+function setupFacets() {
+  const box = searchView.querySelector("#facets");
+  box.innerHTML = `
+    <h2>Species</h2>
+    <div class="facet-list" id="species-list"></div>
+    <h2>Resolution</h2>
+    <div id="res-slot"></div>
+    <button class="link-button clear-facets" type="button" hidden>Clear filters</button>`;
+  const f = state.facets;
+  resSlider = createResSlider((min, max) => {
+    f.resMin = min;
+    f.resMax = max;
+    updateResults();
+  });
+  box.querySelector("#res-slot").replaceWith(resSlider.el);
+  box.querySelector("#species-list").addEventListener("change", (e) => {
+    const cb = e.target;
+    if (cb.checked) f.species.add(cb.value);
+    else f.species.delete(cb.value);
+    updateResults();
+  });
+  box.querySelector(".clear-facets").addEventListener("click", () => {
+    Object.assign(f, { species: new Set(), resMin: null, resMax: null });
+    resSlider.set(null, null);
+    updateResults();
+  });
+}
+
+/** Facet counts follow the other filters, not their own (as on booking sites). */
+function updateFacets() {
+  const f = state.facets;
+  const box = searchView.querySelector("#facets");
+
+  // every species stays listed in a fixed order so rows don't jump while the slider moves
+  const speciesCounts = facetCounts(byName(search(DOCS, state.q, { resMin: f.resMin, resMax: f.resMax }))).species;
+  box.querySelector("#species-list").innerHTML = SPECIES_ORDER.map((v) => {
+    const n = speciesCounts.get(v) || 0;
+    const on = f.species.has(v);
+    const common = commonName(v);
+    return `<label class="facet-item${n ? "" : " empty"}" title="${esc(v)}"><input type="checkbox" value="${esc(v)}" ${on ? "checked" : ""} ${n || on ? "" : "disabled"}/>
+      <span>${common ? esc(common) : `<em>${esc(v)}</em>`}</span><span class="count">${n}</span></label>`;
+  }).join("");
+
+  // atlases (names) available at each resolution, given the query and species filter
+  const sets = RES_VALUES.map(() => new Set());
+  for (const r of search(DOCS, state.q, { species: f.species })) sets[KEY_RES_INDEX.get(r.atlas.key)]?.add(r.atlas.name);
+  resSlider.setCounts(sets.map((s) => s.size));
+
+  box.querySelector(".clear-facets").hidden = !(f.species.size || f.resMin != null || f.resMax != null);
+}
+
+
+// ---------------------------------------------------------------------------
+// atlas page (one per atlas name, covering all its resolutions)
+// ---------------------------------------------------------------------------
+const COMPONENTS = [
+  { id: "template", label: "Template", help: "reference image" },
+  { id: "annotation", label: "Annotation", help: "region label volume" },
+  { id: "hemispheres", label: "Hemisphere map", help: "left/right label volume" },
+];
+
+/** Multiscale store of one component for one atlas entry, or null. */
+function componentStore(atlas, comp) {
+  const urls = componentUrls(INDEX, atlas);
+  if (comp.id === "template") {
+    const t = INDEX.templates[atlas.template.location];
+    return t && { id: atlas.template.location, url: urls.template, levels: t.levels, version: atlas.template.version, level: atlas.template.level, atlas };
+  }
+  const a = INDEX.annotation_sets[atlas.annotation_set.location];
+  const g = a?.[comp.id === "annotation" ? "annotation" : "hemispheres"];
+  if (!g) return null;
+  return {
+    id: atlas.annotation_set.location,
+    url: urls[comp.id],
+    levels: g.levels,
+    version: atlas.annotation_set.version,
+    level: comp.id === "annotation" ? atlas.annotation_set.level : atlas.annotation_set.hemispheres_level,
+    atlas,
+  };
+}
+
+function levelLabel(lv) {
+  const um = lv.scale.slice(-3).map((s) => +(s * 1000).toPrecision(6));
+  const res = um.every((x) => x === um[0]) ? `${um[0]} µm` : `${um.join(" × ")} µm`;
+  return { res, um, text: `${lv.shape.join(" × ")} · ${lv.dtype} · ${formatBytes(rawSize(lv.shape, lv.dtype))}` };
+}
+
+const detailOptions = { allLevels: false };
+
+/**
+ * One page per atlas name. `selected` is the atlas entry (resolution) that the
+ * single resolution dropdown at the top of the page selects; everything on the
+ * page (downloads, code, metadata) follows it.
+ */
+function renderDetail(page, selected = null) {
+  const atlas = selected && page.keys.includes(selected) ? selected : page.keys[0];
+  const d = atlas.docs || {};
+  const title = familyOf(atlas);
+  const ann = INDEX.annotation_sets[atlas.annotation_set.location] || {};
+  const term = INDEX.terminologies[atlas.terminology.location];
+  const urls = componentUrls(INDEX, atlas);
+  const stateUrl = stateFileUrl(INDEX, page.name);
+  document.title = `${atlas.key} · BrainGlobe atlas search`;
+  const common = commonName(atlas.species);
+  const variants = [...BY_NAME.values()].filter((p) => p.family === page.family).sort((a, b) => byNameNumeric(a.name, b.name));
+  const sections = [
+    d.description && ["about", "About"],
+    ["download", "Download"],
+    ["neuroglancer", "Neuroglancer"],
+    ["code", "Use from code"],
+    ["metadata", "Metadata"],
+    ["regions", "Brain regions"],
+  ].filter(Boolean);
+  const row = (k, v) => `<tr><th scope="row">${k}</th><td>${v}</td></tr>`;
+
+  const view = h(`
+    <div class="with-sidebar detail">
+      <div class="content">
+        <nav class="breadcrumb" aria-label="Breadcrumb"><a href="#/">Atlas search</a><span aria-hidden="true">›</span><span>${esc(title)}</span></nav>
+        <h1>${esc(title)}</h1>
+        <p class="atlas-line"><span>${common ? `${esc(common)}, ` : ""}<em>${esc(atlas.species)}</em></span>
+          <span>version ${esc(atlas.version)}</span>
+          ${variants.length > 1 ? `<span>one of ${variants.length} atlases in this collection</span>` : ""}</p>
+
+        <div class="atlas-picker">
+          ${variants.length > 1 ? `
+            <label for="variant">Atlas</label>
+            <select id="variant">${variants
+              .map((p) => `<option value="${esc(p.name)}" ${p.name === page.name ? "selected" : ""}>${esc(p.name)}</option>`)
+              .join("")}</select>` : ""}
+          <label for="resolution">Resolution</label>
+          ${page.keys.length > 1
+            ? `<select id="resolution">${page.keys
+                .map((a) => `<option value="${esc(a.key)}" ${a === atlas ? "selected" : ""}>${esc(formatResolution(a))}</option>`)
+                .join("")}</select>`
+            : `<span id="resolution" class="static">${esc(formatResolution(atlas))}</span>`}
+          <span class="label" id="key-label">Atlas name</span>
+          <div class="copy-field" role="group" aria-labelledby="key-label">
+            <code>${esc(atlas.key)}</code>
+            <button class="btn small" type="button" data-copy="${esc(atlas.key)}">Copy</button>
+          </div>
+        </div>
+
+        <div class="actions">
+          <a class="btn primary" id="ng-open" href="#" target="_blank" rel="noopener">Open in neuroglancer</a>
+          <button class="btn" id="ng-copy" type="button">Copy neuroglancer link</button>
+        </div>
+
+        ${d.description ? `<section id="about"><h2>About</h2>${d.description.split("\n\n").map((p) => `<p>${linkify(p)}</p>`).join("")}
+          ${d.docs_url ? `<p><a href="${esc(d.docs_url)}">More in the BrainGlobe atlas documentation</a></p>` : ""}</section>` : ""}
+
+        <section id="download">
+          <h2>Download</h2>
+          <table class="dl-table">
+            <thead><tr><th>Component</th><th>Size at ${esc(formatResolution(atlas))}</th><th>Format</th></tr></thead>
+            <tbody id="dl-body"></tbody>
+          </table>
+          <label class="option"><input type="checkbox" id="opt-all-levels" ${detailOptions.allLevels ? "checked" : ""}/> Include all resolution levels in OME-Zarr downloads</label>
+          <p class="note" id="itk-note" hidden></p>
+          <p class="note">Volumes are read chunk by chunk from the public OME-Zarr stores and converted in your browser.
+            TIFF files are multi-page stacks in (z, y, x) order. NIfTI and NRRD files carry a RAS affine derived from
+            the atlas orientation (<code>${esc(atlas.orientation)}</code>).
+            ${canStreamToDisk
+              ? "Files are written straight to disk as they download."
+              : "This browser cannot stream to disk, so files are assembled in memory; for large volumes use Chrome or Edge, a lower resolution, or the Python API."}</p>
+        </section>
+
+        <section id="neuroglancer">
+          <h2>Neuroglancer</h2>
+          <p>Opens BrainGlobe's published viewer state for this atlas
+            (<a href="${esc(stateUrl)}">${esc(page.name)}.json</a>). It streams the template and annotation at every
+            resolution level, with region names and meshes.</p>
+          <label class="field"><span>Neuroglancer instance</span>
+            <input id="ng-base" type="url" value="${esc(ngBase())}" /></label>
+        </section>
+
+        <section id="code">
+          <h2>Use from code</h2>
+          <h3>Python</h3>
+          ${snippet(`from brainglobe_atlasapi import BrainGlobeAtlas\n\natlas = BrainGlobeAtlas("${atlas.key}")\ntemplate = atlas.template        # numpy array (z, y, x)\nannotation = atlas.annotation\nhemispheres = atlas.hemispheres\nprint(atlas.lookup_df)           # brain regions`)}
+          <h3>Command line</h3>
+          ${snippet(`brainglobe install -a ${atlas.key}`)}
+        </section>
+
+        <section id="metadata">
+          <h2>Metadata</h2>
+          <table class="meta">
+            ${row("Atlas name", `<code>${esc(atlas.key)}</code>`)}
+            ${row("Species", `<em>${esc(atlas.species)}</em>`)}
+            ${row("Version", esc(atlas.version))}
+            ${row("Resolution", `${esc(atlas.resolution.join(" × "))} µm`)}
+            ${row("Shape", `${esc(atlas.shape.join(" × "))} (z, y, x)`)}
+            ${row("Orientation", `<code>${esc(atlas.orientation)}</code>`)}
+            ${row("Symmetric", atlas.symmetric ? "yes" : "no")}
+            ${row("Citation", linkify(atlas.citation))}
+            ${row("Atlas link", linkify(atlas.atlas_link))}
+            ${atlas.additional_references.length ? row("References", atlas.additional_references.map(linkify).join("<br>")) : ""}
+            ${atlas.atlas_packager ? row("Packager", linkify(atlas.atlas_packager)) : ""}
+            ${row("Coordinate space", `<code>${esc(atlas.coordinate_space)}</code>`)}
+            ${row("Template", `<code>${esc(atlas.template.name)}</code> v${esc(atlas.template.version)}`)}
+            ${row("Annotation set", `<code>${esc(atlas.annotation_set.name)}</code> v${esc(atlas.annotation_set.version)}`)}
+            ${row("Terminology", `<code>${esc(atlas.terminology.name)}</code> v${esc(atlas.terminology.version)}`)}
+            ${row("Meshes", ann.meshes ? "yes" : "no")}
+            ${row("Manifest", `<a href="${esc(urls.manifest)}">manifest.json</a>`)}
+          </table>
+        </section>
+
+        <section id="regions">
+          <h2>Brain regions${term ? ` <span class="count">${term.count}</span>` : ""}</h2>
+          <input class="text-input" id="region-q" type="search" placeholder="Filter by name or acronym" aria-label="Filter regions" />
+          <div class="tree" id="tree"><p class="muted">Loading…</p></div>
+        </section>
+      </div>
+
+      <aside class="toc" aria-label="On this page">
+        <h2>On this page</h2>
+        <ul>${sections.map(([id, label]) => `<li><a href="#${id}" data-jump="${id}">${label}</a></li>`).join("")}</ul>
+      </aside>
+    </div>`);
+
+  view.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-copy]");
+    if (b) copy(b.dataset.copy);
+  });
+  // in-page links: scroll without touching the hash router
+  view.querySelectorAll("[data-jump]").forEach((a) =>
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      view.querySelector(`#${a.dataset.jump}`)?.scrollIntoView({ behavior: "smooth" });
+    }),
+  );
+  view.querySelector("#variant")?.addEventListener("change", (e) => {
+    location.hash = pageHref(e.target.value);
+  });
+  view.querySelector("select#resolution")?.addEventListener("change", (e) => {
+    // the URL names the selected resolution, so links keep it
+    history.replaceState(null, "", pageHref(e.target.value));
+    renderDetail(page, BY_KEY.get(e.target.value));
+    app.querySelector("#resolution")?.focus();
+  });
+  view.querySelector("#opt-all-levels").addEventListener("change", (e) => (detailOptions.allLevels = e.target.checked));
+  app.replaceChildren(view);
+
+  renderDownloads(view, page, atlas);
+
+  const ngOpen = view.querySelector("#ng-open");
+  const ngBaseInput = view.querySelector("#ng-base");
+  const ngLink = () => viewerUrl(stateUrl, ngBaseInput.value);
+  ngOpen.href = ngLink();
+  ngBaseInput.addEventListener("change", () => {
+    storageSet("ngBase", ngBaseInput.value && ngBaseInput.value !== DEFAULT_NEUROGLANCER ? ngBaseInput.value : null);
+    ngOpen.href = ngLink();
+  });
+  view.querySelector("#ng-copy").addEventListener("click", () => copy(ngLink(), "Neuroglancer link copied"));
+
+  loadTerminology(atlas).then((rows) => {
+    if (!view.isConnected) return;
+    renderTree(view, rows);
+    const over = rows ? rows.filter((r) => r.value > ITKSNAP_MAX_LABEL).length : 0;
+    if (over) {
+      const note = view.querySelector("#itk-note");
+      note.textContent = `${over} of ${rows.length} regions have annotation values above ${ITKSNAP_MAX_LABEL}, which ITK-SNAP cannot represent; they are commented out in the ITK-SNAP label file.`;
+      note.hidden = false;
+    }
+    renderOntologyRow(view, atlas, rows, urls);
+  });
+}
+
+function snippet(code) {
+  return `<div class="snippet-wrap"><pre class="snippet"><code>${esc(code)}</code></pre><button class="btn small" type="button" data-copy="${esc(code)}">Copy</button></div>`;
+}
+
+function renderDownloads(view, page, atlas) {
+  const body = view.querySelector("#dl-body");
+  const allLevels = view.querySelector("#opt-all-levels");
+  for (const comp of COMPONENTS) {
+    const store = componentStore(atlas, comp);
+    const level = store?.levels.find((l) => l.path === store.level);
+    if (!level) {
+      body.append(h(`<tr><td class="what">${comp.label}<small>${comp.help}</small></td><td colspan="2" class="muted">Not available for this atlas</td></tr>`));
+      continue;
+    }
+    const row = h(`
+      <tr>
+        <td class="what">${comp.label}<small>${comp.help}</small></td>
+        <td class="size">${esc(levelLabel(level).text)}</td>
+        <td><div class="fmt-buttons">${Object.entries(FORMATS)
+          .map(([k, f]) => `<button class="btn small" type="button" data-fmt="${k}" title="${esc(f.note)}">${f.label}</button>`)
+          .join("")}</div></td>
+      </tr>`);
+    row.querySelectorAll("[data-fmt]").forEach((btn) =>
+      btn.addEventListener("click", () => {
+        const fmt = btn.dataset.fmt;
+        const all = fmt === "ome-zarr" && allLevels.checked;
+        const filename = `${all ? `${page.name}_multiscale` : atlas.key}_${comp.id}${FORMATS[fmt].ext}`;
+        // open the save dialog synchronously within the click gesture
+        const sinkPromise = openSink(filename, { gzip: sinkGzip(fmt) });
+        startJob(filename, (onProgress, signal) =>
+          exportVolume({
+            zarrUrl: store.url,
+            level,
+            levels: store.levels,
+            allLevels: all,
+            format: fmt,
+            orientation: atlas.orientation,
+            filename,
+            description: `BrainGlobe ${atlas.key} ${comp.id}`,
+            onProgress,
+            signal,
+            sinkPromise,
+          }),
+          sinkPromise,
+        );
+      }),
+    );
+    body.append(row);
+  }
+  body.append(h(`<tr id="ontology-row"><td class="what">Ontology<small>region terminology</small></td><td class="muted">${esc(atlas.terminology.name)}</td><td class="muted">Loading…</td></tr>`));
+}
+
+
+function renderOntologyRow(view, atlas, rows, urls) {
+  const row = view.querySelector("#ontology-row");
+  if (!row) return;
+  const cell = row.lastElementChild;
+  if (!rows) {
+    cell.textContent = "Not available";
+    return;
+  }
+  cell.classList.remove("muted");
+  cell.innerHTML = `<div class="fmt-buttons">
+    <button class="btn small" type="button" data-o="csv" title="Original BrainGlobe terminology.csv">CSV</button>
+    <button class="btn small" type="button" data-o="json" title="BrainGlobe structures.json (list of structures)">JSON</button>
+    <button class="btn small" type="button" data-o="itk" title="ITK-SNAP label description file (labels above 65535 are commented out)">ITK-SNAP</button>
+    <button class="btn small" type="button" data-o="ctbl" title="3D Slicer colour table">Slicer</button></div>`;
+  const base = atlas.terminology.name;
+  const outputs = {
+    csv: [`${base}.csv`, "text/csv", async () => new Uint8Array(await (await fetch(urls.terminology)).arrayBuffer())],
+    json: [`${base}_structures.json`, "application/json", () => toStructuresJson(rows)],
+    itk: [`${base}_itksnap.txt`, "text/plain", () => toItkSnap(rows)],
+    ctbl: [`${base}.ctbl`, "text/plain", () => toSlicerCtbl(rows)],
+  };
+  cell.querySelectorAll("[data-o]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const [name, mime, make] = outputs[b.dataset.o];
+      const sinkPromise = openSink(name, { mimeType: mime });
+      startJob(name, async () => saveText(name, await make(), mime, sinkPromise), sinkPromise);
+    }),
+  );
+}
+
+function renderTree(view, rows) {
+  const box = view.querySelector("#tree");
+  const input = view.querySelector("#region-q");
+  if (!rows) {
+    box.innerHTML = `<p class="muted">No terminology available.</p>`;
+    input.hidden = true;
+    return;
+  }
+  const roots = buildTree(rows);
+  const swatch = (c) => `<span class="swatch" style="background:${esc(c || "#ccc")}"></span>`;
+  const label = (n) => `${swatch(n.color)}${esc(n.name)}<span class="acr">${esc(n.acronym)}</span><span class="val">${esc(n.value)}</span>`;
+  const renderNode = (n, depth) =>
+    n.children.length
+      ? `<li><details ${depth < 1 ? "open" : ""}><summary>${label(n)}</summary><ul>${n.children.map((c) => renderNode(c, depth + 1)).join("")}</ul></details></li>`
+      : `<li class="leaf">${label(n)}</li>`;
+  const full = `<ul>${roots.map((r) => renderNode(r, 0)).join("")}</ul>`;
+  box.innerHTML = full;
+  input.addEventListener("input", () => {
+    const q = input.value.trim().toLowerCase();
+    if (!q) {
+      box.innerHTML = full;
+      return;
+    }
+    const hits = rows.filter((r) => r.name.toLowerCase().includes(q) || r.acronym.toLowerCase().includes(q)).slice(0, 300);
+    box.innerHTML = hits.length
+      ? `<ul>${hits.map((r) => `<li class="leaf">${label(r)}</li>`).join("")}</ul>`
+      : `<p class="muted">No matching regions.</p>`;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// download jobs
+// ---------------------------------------------------------------------------
+let jobCount = 0;
+
+function startJob(name, run, sinkPromise) {
+  const id = ++jobCount;
+  const ctrl = new AbortController();
+  jobsEl.hidden = false;
+  if (!jobsEl.querySelector("h3")) {
+    jobsEl.append(h(`<h3>Downloads <button class="link-button" type="button">Hide</button></h3>`));
+    jobsEl.querySelector("h3 button").addEventListener("click", () => {
+      jobsEl.hidden = true;
+      jobsEl.querySelectorAll(".job.done, .job.error").forEach((j) => j.remove());
+    });
+  }
+  const el = h(`<div class="job" id="job-${id}">
+      <div class="name">${esc(name)}</div>
+      <progress max="1" value="0"></progress>
+      <div class="status"><span class="msg">Waiting for save location…</span><button class="link-button" type="button">Cancel</button></div>
+    </div>`);
+  jobsEl.append(el);
+  const msg = el.querySelector(".msg");
+  const bar = el.querySelector("progress");
+  const cancel = el.querySelector("button");
+  cancel.addEventListener("click", () => ctrl.abort());
+  const t0 = performance.now();
+  const onProgress = (done, total, unit) => {
+    bar.max = total || 1;
+    bar.value = done;
+    const pct = total ? Math.round((100 * done) / total) : 0;
+    const elapsed = (performance.now() - t0) / 1000;
+    const label = unit === "files" ? `${done}/${total} files` : `${formatBytes(done)} / ${formatBytes(total)}`;
+    const eta = done && total && elapsed > 2 ? ` · ~${Math.max(1, Math.round((elapsed * (total - done)) / done))} s left` : "";
+    msg.textContent = `${pct}% · ${label}${eta}`;
+  };
+  (async () => {
+    try {
+      await sinkPromise; // wait for the save dialog
+      msg.textContent = "Starting…";
+      await run(onProgress, ctrl.signal);
+      el.classList.add("done");
+      bar.value = bar.max;
+      msg.textContent = `Done in ${Math.round((performance.now() - t0) / 100) / 10} s`;
+      cancel.remove();
+    } catch (e) {
+      if (e?.name === "AbortError") {
+        el.remove();
+        if (!jobsEl.querySelector(".job")) jobsEl.hidden = true;
+        return;
+      }
+      console.error(e);
+      el.classList.add("error");
+      msg.textContent = `Failed: ${e?.message || e}`;
+      cancel.remove();
+    }
+  })();
+}
+
+window.addEventListener("beforeunload", (e) => {
+  if (jobsEl.querySelector(".job:not(.done):not(.error)")) {
+    e.preventDefault();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// boot
+// ---------------------------------------------------------------------------
+async function boot() {
+  setupThemeToggle();
+  try {
+    const r = await fetch("data/index.json");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    INDEX = await r.json();
+  } catch (e) {
+    app.innerHTML = `<p class="muted">Could not load the atlas index (data/index.json): ${esc(e.message)}.<br>
+      Run <code>python scripts/build_index.py</code> to generate it.</p>`;
+    return;
+  }
+  for (const a of INDEX.atlases) {
+    BY_KEY.set(a.key, a);
+    if (!BY_NAME.has(a.name)) BY_NAME.set(a.name, { name: a.name, family: familyOf(a), keys: [] });
+    BY_NAME.get(a.name).keys.push(a);
+  }
+  for (const p of BY_NAME.values()) p.keys.sort((x, y) => minResolution(x) - minResolution(y) || compareAtlases(x, y));
+  DOCS = buildSearchIndex(INDEX);
+  buildResolutionStops();
+  state.q = new URL(location.href).searchParams.get("q") || "";
+  const dateEl = document.getElementById("index-date");
+  if (INDEX.generated) dateEl.textContent = `Index built ${INDEX.generated.slice(0, 10)}.`;
+  route();
+}
+
+boot();

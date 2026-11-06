@@ -1,0 +1,62 @@
+name: Build index and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *" # nightly: pick up newly released atlases
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: |
+          pip install numpy zstandard tifffile nibabel pynrrd "zarr>=3" fsspec aiohttp
+          npm ci
+      - name: Build atlas index from the BrainGlobe bucket
+        run: python scripts/build_index.py
+      - name: Unit tests (format writers)
+        run: |
+          node tests/write_fixtures.mjs "$RUNNER_TEMP/fixtures"
+          python tests/verify_fixtures.py "$RUNNER_TEMP/fixtures"
+      - name: End-to-end export test against S3
+        run: |
+          node tests/e2e_export.mjs "$RUNNER_TEMP/e2e"
+          python tests/e2e_verify.py "$RUNNER_TEMP/e2e"
+      - name: Build site
+        run: npm run build
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: dist
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
