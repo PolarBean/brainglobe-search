@@ -33,6 +33,14 @@ jobs:
         run: |
           pip install numpy zstandard tifffile nibabel pynrrd "zarr>=3" fsspec aiohttp
           npm ci
+      # Coronal previews are named after the store versions, so previews from
+      # earlier runs stay valid; only new or updated atlases are read again.
+      - name: Restore coronal previews
+        uses: actions/cache@v4
+        with:
+          path: public/data/previews
+          key: previews-${{ github.run_id }}
+          restore-keys: previews-
       - name: Build atlas index from the BrainGlobe bucket
         run: python scripts/build_index.py
       - name: Unit tests (format writers)

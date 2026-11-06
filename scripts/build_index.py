@@ -18,8 +18,11 @@ enriches the atlases with the human-written descriptions from the BrainGlobe
 ``public/data`` and consumed by the static website.
 
 Only the standard library is required. If ``numpy`` and ``zstandard`` are
-installed, a display intensity range is also computed for every template
-(used to set the neuroglancer contrast).
+installed, a display intensity range is also computed for every template,
+and a small coronal-section preview (template + annotation labels) is written
+for every atlas to ``public/data/previews`` so the site never has to read
+the volumes just to show a slice. Previews are named after the store versions
+and are reused when they already exist.
 
 Usage::
 
@@ -29,6 +32,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import base64
 import configparser
 import csv
 import datetime as dt
@@ -38,6 +42,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -192,6 +197,132 @@ def intensity_range(url: str, level: dict) -> list[float] | None:
         return None
     lo, hi = np.percentile(v, [0.5, 99.8])
     return [float(round(lo, 4)), float(round(hi, 4))]
+
+
+# --------------------------------------------------------------------------
+# Coronal previews
+# --------------------------------------------------------------------------
+PREVIEW_MIN_PLANE = 200  # px: coarsest level at least this wide in the slice plane
+NP_DTYPES = {
+    "uint8": "u1", "uint16": "<u2", "uint32": "<u4", "uint64": "<u8", "int8": "i1",
+    "int16": "<i2", "int32": "<i4", "int64": "<i8", "float32": "<f4", "float64": "<f8",
+}
+OPPOSITE = {"a": "p", "p": "a", "s": "i", "i": "s", "l": "r", "r": "l"}
+
+
+def read_plane(url: str, level: dict, axis: int, index: int, problems: list | None = None):
+    """Read one plane (fixed ``index`` along ``axis``) of a zarr v3 array.
+
+    Zarr chunks are 3D, so every chunk the plane crosses is fetched whole; this
+    is why previews are made once here rather than in the browser.
+    """
+    shape, chunks = level["shape"], level["chunks"]
+    dtype = np.dtype(NP_DTYPES[level["dtype"]])
+    rem = [d for d in range(3) if d != axis]
+    out = np.full([shape[d] for d in rem], level.get("fill_value") or 0, dtype=dtype)
+    ci = index // chunks[axis]
+    local = index - ci * chunks[axis]
+    n = [-(-shape[d] // chunks[d]) for d in range(3)]
+
+    def get_block(ab):
+        a, b = ab
+        coord = [0, 0, 0]
+        coord[axis], coord[rem[0]], coord[rem[1]] = ci, a, b
+        key = level["separator"].join(["c", *map(str, coord)])
+        raw = fetch(f"{url}/{level['path']}/{key}")
+        if raw is None:
+            return ab, None  # missing chunk = fill value
+        if "zstd" in level["codecs"]:
+            raw = zstandard.ZstdDecompressor().decompressobj().decompress(raw)
+        block = np.frombuffer(raw, dtype=dtype)
+        if block.size != int(np.prod(chunks)):
+            # e.g. a truncated object in the bucket: leave this region blank
+            print(f"  ! corrupt chunk {url}/{level['path']}/{key} "
+                  f"({block.size} of {int(np.prod(chunks))} values)", file=sys.stderr)
+            if problems is not None:
+                problems.append(f"{level['path']}/{key}")
+            return ab, None
+        # keep only the plane, not the whole decompressed chunk
+        return ab, np.take(block.reshape(chunks), local, axis=axis).copy()
+
+    blocks = [(a, b) for a in range(n[rem[0]]) for b in range(n[rem[1]])]
+    with ThreadPoolExecutor(8) as ex:
+        for (a, b), plane in ex.map(get_block, blocks):
+            if plane is None:
+                continue
+            r0, c0 = a * chunks[rem[0]], b * chunks[rem[1]]
+            h = min(chunks[rem[0]], shape[rem[0]] - r0)
+            w = min(chunks[rem[1]], shape[rem[1]] - c0)
+            out[r0:r0 + h, c0:c0 + w] = plane[:h, :w]
+    return out
+
+
+def coronal_preview(t_url: str, tinfo: dict, a_url: str, ainfo: dict | None, orientation: str) -> dict | None:
+    """Middle coronal section: contrast-scaled template and annotation labels.
+
+    Returned arrays are oriented for display: rows run superior -> inferior,
+    columns follow the stored left/right axis (``left``/``right`` give which
+    hemisphere is on each side of the image).
+    """
+    o = (orientation or "").lower()
+    try:
+        ap = next(i for i, c in enumerate(o) if c in "ap")
+        v = next(i for i, c in enumerate(o) if c in "si")
+        hz = next(i for i, c in enumerate(o) if c in "lr")
+    except StopIteration:
+        return None
+    levels = tinfo["levels"]  # fine -> coarse
+    wide = [lv for lv in levels if max(lv["shape"][d] for d in range(3) if d != ap) >= PREVIEW_MIN_PLANE]
+    tl = wide[-1] if wide else levels[0]
+    index = tl["shape"][ap] // 2
+    pos = tl["translation"][ap] + index * tl["scale"][ap]  # mm
+
+    def oriented(plane, lv):
+        rem = [d for d in range(3) if d != ap]
+        if rem.index(v) != 0:
+            plane = plane.T  # rows = superior/inferior axis
+        if o[v] == "i":
+            plane = plane[::-1]  # superior at the top
+        return np.ascontiguousarray(plane)
+
+    corrupt = {"template": [], "annotation": []}
+    tpl = oriented(read_plane(t_url, tl, ap, index, corrupt["template"]), tl).astype(np.float64)
+    nz = tpl[tpl > 0]
+    lo, hi = np.percentile(nz, [0.5, 99.5]) if nz.size else (0.0, 1.0)
+    grey = np.clip((tpl - lo) / max(hi - lo, 1e-9) * 255, 0, 255).astype(np.uint8)
+
+    labels = None
+    if ainfo and ainfo.get("levels"):
+        al = min(
+            ainfo["levels"],
+            key=lambda lv: sum(abs(np.log(a / b)) for a, b in zip(lv["scale"], tl["scale"])),
+        )
+        ai = int(round((pos - al["translation"][ap]) / al["scale"][ap]))
+        ai = min(max(ai, 0), al["shape"][ap] - 1)
+        lab = oriented(read_plane(a_url, al, ap, ai, corrupt["annotation"]), al)
+        # nearest-neighbour onto the template grid (if the levels differ)
+        rows = (np.arange(grey.shape[0]) * lab.shape[0]) // grey.shape[0]
+        cols = (np.arange(grey.shape[1]) * lab.shape[1]) // grey.shape[1]
+        lab = lab[rows][:, cols]
+        labels = lab.astype("<u4")
+
+    b64 = lambda a: base64.b64encode(zlib.compress(a.tobytes(), 9)).decode()  # noqa: E731
+    return {
+        "level": {"path": tl["path"], "scale": tl["scale"], "translation": tl["translation"]},
+        "ap_axis": ap,
+        "ap_from": o[ap],
+        "index": index,
+        "position_mm": pos,
+        "width": int(grey.shape[1]),
+        "height": int(grey.shape[0]),
+        "aspect": (grey.shape[1] * tl["scale"][hz]) / (grey.shape[0] * tl["scale"][v]),
+        "left": o[hz].upper(),
+        "right": OPPOSITE[o[hz]].upper(),
+        "template": b64(grey),
+        "labels": b64(labels) if labels is not None else None,
+        # chunks in the bucket that could not be decoded (drawn blank)
+        "corrupt_chunks": {k: v for k, v in corrupt.items() if v},
+    }
 
 
 def match_level(levels: list[dict], resolution_um: list[float]) -> str | None:
@@ -374,6 +505,44 @@ def build(out_dir: Path, docs_path: Path | None, workers: int = 16) -> None:
         annotations = dict(f.result() for f in f_a)
         terms_full = dict(f.result() for f in f_r)
 
+    # Coronal previews, one per (template, annotation set) pair.
+    previews: dict[tuple[str, str], str | None] = {}
+    if np is not None:
+        prev_dir = out_dir / "previews"
+        prev_dir.mkdir(exist_ok=True)
+        pairs = {}
+        for m in manifests.values():
+            pair = (m["template"]["location"], m["annotation_set"]["location"])
+            pairs.setdefault(pair, m.get("orientation", "asr"))
+
+        def get_preview(item):
+            (t_loc, a_loc), orientation = item
+            fname = f"{slug(t_loc)}__{slug(a_loc)}.json"
+            path = prev_dir / fname
+            if not path.exists():  # previews are keyed by store versions
+                tinfo = templates.get(t_loc)
+                ainfo = (annotations.get(a_loc) or {}).get("annotation")
+                if not tinfo or not tinfo.get("levels"):
+                    return (t_loc, a_loc), None
+                try:
+                    p = coronal_preview(
+                        f"{loc_url(t_loc)}/template.ome.zarr", tinfo,
+                        f"{loc_url(a_loc)}/annotations_compressed.ome.zarr", ainfo, orientation,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    print(f"  ! preview failed for {t_loc}: {e}", file=sys.stderr)
+                    return (t_loc, a_loc), None
+                if p is None:
+                    return (t_loc, a_loc), None
+                path.write_text(json.dumps(p, separators=(",", ":")))
+                print(f"  preview {fname}", file=sys.stderr, flush=True)
+            return (t_loc, a_loc), f"previews/{fname}"
+
+        # few workers: single-resolution atlases have very large chunks
+        with ThreadPoolExecutor(min(workers, 6)) as ex:
+            previews = dict(ex.map(get_preview, pairs.items()))
+        print(f"{sum(1 for v in previews.values() if v)} coronal previews", file=sys.stderr)
+
     # Region-name search index (deduplicated across terminologies).
     terminologies = {}
     for loc, t in terms_full.items():
@@ -436,6 +605,7 @@ def build(out_dir: Path, docs_path: Path | None, workers: int = 16) -> None:
                 ),
             },
             "terminology": m["terminology"],
+            "preview": previews.get((t_loc, a_loc)),
             **({"docs": docs[key]} if key in docs else {}),
         }
         atlases.append(entry)

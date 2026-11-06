@@ -1,8 +1,9 @@
 import { exportVolume, FORMATS, saveText, sinkGzip } from "./export/export.js";
 import { rawSize } from "./export/formats.js";
-import { buildTree, ITKSNAP_MAX_LABEL, toItkSnap, toSlicerCtbl, toStructuresJson } from "./export/ontology.js";
+import { buildTree, hexToRgb, ITKSNAP_MAX_LABEL, toItkSnap, toSlicerCtbl, toStructuresJson } from "./export/ontology.js";
 import { canStreamToDisk, openSink } from "./export/sink.js";
-import { componentUrls, DEFAULT_NEUROGLANCER, stateFileUrl, viewerUrl } from "./neuroglancer.js";
+import { componentUrls, stateFileUrl, viewerUrl } from "./neuroglancer.js";
+import { loadPreview } from "./slice.js";
 import { buildSearchIndex, commonName, compareAtlases, facetCounts, formatResolution, minResolution, search } from "./search.js";
 
 const app = document.getElementById("app");
@@ -101,7 +102,6 @@ function storageSet(k, v) {
   }
 }
 
-const ngBase = () => storageGet("ngBase") || DEFAULT_NEUROGLANCER;
 
 async function loadTerminology(atlas) {
   const t = INDEX.terminologies[atlas.terminology.location];
@@ -493,12 +493,11 @@ function renderDetail(page, selected = null) {
   const common = commonName(atlas.species);
   const variants = [...BY_NAME.values()].filter((p) => p.family === page.family).sort((a, b) => byNameNumeric(a.name, b.name));
   const sections = [
-    d.description && ["about", "About"],
+    ["about", "About"],
     ["download", "Download"],
-    ["neuroglancer", "Neuroglancer"],
+    ["regions", "Brain regions"],
     ["code", "Use from code"],
     ["metadata", "Metadata"],
-    ["regions", "Brain regions"],
   ].filter(Boolean);
   const row = (k, v) => `<tr><th scope="row">${k}</th><td>${v}</td></tr>`;
 
@@ -535,8 +534,16 @@ function renderDetail(page, selected = null) {
           <button class="btn" id="ng-copy" type="button">Copy neuroglancer link</button>
         </div>
 
-        ${d.description ? `<section id="about"><h2>About</h2>${d.description.split("\n\n").map((p) => `<p>${linkify(p)}</p>`).join("")}
-          ${d.docs_url ? `<p><a href="${esc(d.docs_url)}">More in the BrainGlobe atlas documentation</a></p>` : ""}</section>` : ""}
+        <section id="about"><h2>About</h2>
+          <figure class="slice-figure" id="slice-figure">
+            <div class="slice-panels">
+              <div class="slice-panel"><canvas id="slice-template" aria-label="Coronal section of the template"></canvas></div>
+              <div class="slice-panel"><canvas id="slice-annotation" aria-label="Coronal section of the annotation"></canvas></div>
+            </div>
+            <figcaption id="slice-caption" class="muted">Loading coronal section…</figcaption>
+          </figure>
+          ${d.description ? d.description.split("\n\n").map((p) => `<p>${linkify(p)}</p>`).join("") : ""}
+          ${d.docs_url ? `<p><a href="${esc(d.docs_url)}">More in the BrainGlobe atlas documentation</a></p>` : ""}</section>
 
         <section id="download">
           <h2>Download</h2>
@@ -554,13 +561,11 @@ function renderDetail(page, selected = null) {
               : "This browser cannot stream to disk, so files are assembled in memory; for large volumes use Chrome or Edge, a lower resolution, or the Python API."}</p>
         </section>
 
-        <section id="neuroglancer">
-          <h2>Neuroglancer</h2>
-          <p>Opens BrainGlobe's published viewer state for this atlas
-            (<a href="${esc(stateUrl)}">${esc(page.name)}.json</a>). It streams the template and annotation at every
-            resolution level, with region names and meshes.</p>
-          <label class="field"><span>Neuroglancer instance</span>
-            <input id="ng-base" type="url" value="${esc(ngBase())}" /></label>
+        <section id="regions">
+          <h2>Brain regions${term ? ` <span class="count">${term.count}</span>` : ""}</h2>
+          <div class="region-filter"><input class="text-input" id="region-q" type="search" placeholder="Filter by name or acronym" aria-label="Filter regions" />
+            <span class="muted" id="region-status" aria-live="polite"></span></div>
+          <div class="tree" id="tree"><p class="muted">Loading…</p></div>
         </section>
 
         <section id="code">
@@ -591,14 +596,10 @@ function renderDetail(page, selected = null) {
             ${row("Terminology", `<code>${esc(atlas.terminology.name)}</code> v${esc(atlas.terminology.version)}`)}
             ${row("Meshes", ann.meshes ? "yes" : "no")}
             ${row("Manifest", `<a href="${esc(urls.manifest)}">manifest.json</a>`)}
+            ${row("Neuroglancer state", `<a href="${esc(stateUrl)}">${esc(page.name)}.json</a>`)}
           </table>
         </section>
 
-        <section id="regions">
-          <h2>Brain regions${term ? ` <span class="count">${term.count}</span>` : ""}</h2>
-          <input class="text-input" id="region-q" type="search" placeholder="Filter by name or acronym" aria-label="Filter regions" />
-          <div class="tree" id="tree"><p class="muted">Loading…</p></div>
-        </section>
       </div>
 
       <aside class="toc" aria-label="On this page">
@@ -633,14 +634,11 @@ function renderDetail(page, selected = null) {
   renderDownloads(view, page, atlas);
 
   const ngOpen = view.querySelector("#ng-open");
-  const ngBaseInput = view.querySelector("#ng-base");
-  const ngLink = () => viewerUrl(stateUrl, ngBaseInput.value);
-  ngOpen.href = ngLink();
-  ngBaseInput.addEventListener("change", () => {
-    storageSet("ngBase", ngBaseInput.value && ngBaseInput.value !== DEFAULT_NEUROGLANCER ? ngBaseInput.value : null);
-    ngOpen.href = ngLink();
-  });
-  view.querySelector("#ng-copy").addEventListener("click", () => copy(ngLink(), "Neuroglancer link copied"));
+  const ngLink = viewerUrl(stateUrl);
+  ngOpen.href = ngLink;
+  view.querySelector("#ng-copy").addEventListener("click", () => copy(ngLink, "Neuroglancer link copied"));
+
+  renderSlice(view, atlas);
 
   loadTerminology(atlas).then((rows) => {
     if (!view.isConnected) return;
@@ -653,6 +651,76 @@ function renderDetail(page, selected = null) {
     }
     renderOntologyRow(view, atlas, rows, urls);
   });
+}
+
+/** Middle coronal section (pre-rendered by the index builder), template beside annotation. */
+async function renderSlice(view, atlas) {
+  const fig = view.querySelector("#slice-figure");
+  const caption = view.querySelector("#slice-caption");
+  const selLevel = INDEX.templates[atlas.template.location]?.levels.find((l) => l.path === atlas.template.level);
+  if (!atlas.preview || !selLevel) {
+    fig.remove();
+    return;
+  }
+  try {
+    const rows = await loadTerminology(atlas);
+    const colours = new Map((rows || []).map((r) => [r.value, hexToRgb(r.color)]));
+    const img = await loadPreview(`data/${atlas.preview}`, colours);
+    if (!view.isConnected) return;
+
+    // the slice index in the selected resolution, from the preview's physical position
+    const ap = img.ap_axis;
+    const n = selLevel.shape[ap];
+    const res = selLevel.scale[ap];
+    const index = Math.min(n - 1, Math.max(0, Math.round((img.position_mm - selLevel.translation[ap]) / res)));
+    const fromAnterior = (img.ap_from === "a" ? index : n - 1 - index) * res;
+
+    const draw = (canvas, data) => {
+      canvas.width = img.width;
+      canvas.height = img.height;
+      canvas.getContext("2d").putImageData(data, 0, 0);
+      canvas.style.aspectRatio = String(img.aspect);
+      canvas.parentElement.dataset.left = img.left;
+      canvas.parentElement.dataset.right = img.right;
+    };
+    const tc = view.querySelector("#slice-template");
+    const ac = view.querySelector("#slice-annotation");
+    draw(tc, img.template);
+    if (img.labels) draw(ac, img.overlay);
+    else ac.parentElement.remove();
+
+    const shownUm = +(img.level.scale[ap] * 1000).toPrecision(4);
+    caption.classList.remove("muted");
+    caption.innerHTML = `<strong>Coronal section ${index} of ${n}</strong> of <code>${esc(atlas.key)}</code>
+      (0-based index along the anterior–posterior axis, ${fromAnterior.toFixed(2)} mm from the anterior edge).
+      Left: template.${img.labels ? " Right: annotation in the atlas colours over the template." : ""}
+      Shown at ${esc(String(shownUm))} µm, viewed from the front, with the
+      ${img.left === "L" ? "left" : "right"} hemisphere on the left of the image.
+      ${Object.keys(img.corrupt_chunks || {}).length
+        ? `<span class="slice-warning">Black rectangles are missing data: ${Object.entries(img.corrupt_chunks)
+            .map(([k, v]) => `${v.length} corrupt chunk${v.length === 1 ? "" : "s"} in the published ${k} (${v.map((c) => `<code>${esc(c)}</code>`).join(", ")})`)
+            .join("; ")}.</span>`
+        : ""}
+      ${img.labels ? `<span class="slice-hover" id="slice-hover">Hover over the annotation to name a region.</span>` : ""}`;
+
+    if (img.labels) {
+      const byValue = new Map((rows || []).map((r) => [r.value, r]));
+      const hover = view.querySelector("#slice-hover");
+      const idle = "Hover over the annotation to name a region.";
+      ac.addEventListener("mousemove", (e) => {
+        const r = ac.getBoundingClientRect();
+        const x = Math.min(img.width - 1, Math.floor(((e.clientX - r.left) / r.width) * img.width));
+        const y = Math.min(img.height - 1, Math.floor(((e.clientY - r.top) / r.height) * img.height));
+        const v = img.labels[y * img.width + x];
+        const row = byValue.get(v);
+        hover.textContent = v ? (row ? `${row.name} (${row.acronym})` : `Label ${v}`) : "Outside the annotated regions.";
+      });
+      ac.addEventListener("mouseleave", () => (hover.textContent = idle));
+    }
+  } catch (e) {
+    console.error(e);
+    if (view.isConnected) fig.remove();
+  }
 }
 
 function snippet(code) {
@@ -741,6 +809,7 @@ function renderOntologyRow(view, atlas, rows, urls) {
 function renderTree(view, rows) {
   const box = view.querySelector("#tree");
   const input = view.querySelector("#region-q");
+  const status = view.querySelector("#region-status");
   if (!rows) {
     box.innerHTML = `<p class="muted">No terminology available.</p>`;
     input.hidden = true;
@@ -748,23 +817,69 @@ function renderTree(view, rows) {
   }
   const roots = buildTree(rows);
   const swatch = (c) => `<span class="swatch" style="background:${esc(c || "#ccc")}"></span>`;
-  const label = (n) => `${swatch(n.color)}${esc(n.name)}<span class="acr">${esc(n.acronym)}</span><span class="val">${esc(n.value)}</span>`;
-  const renderNode = (n, depth) =>
+  const mark = (text, q) => {
+    const i = q ? text.toLowerCase().indexOf(q) : -1;
+    return i < 0 ? esc(text) : `${esc(text.slice(0, i))}<mark>${esc(text.slice(i, i + q.length))}</mark>${esc(text.slice(i + q.length))}`;
+  };
+  const label = (n, q = "") =>
+    `${swatch(n.color)}${mark(n.name, q)}<span class="acr">${mark(n.acronym, q)}</span><span class="val">${esc(n.value)}</span>`;
+
+  // whole subtree; only the top level open unless `open` says otherwise
+  const renderNode = (n, depth, q = "") =>
     n.children.length
-      ? `<li><details ${depth < 1 ? "open" : ""}><summary>${label(n)}</summary><ul>${n.children.map((c) => renderNode(c, depth + 1)).join("")}</ul></details></li>`
-      : `<li class="leaf">${label(n)}</li>`;
+      ? `<li><details ${depth < 1 ? "open" : ""}><summary>${label(n, q)}</summary><ul>${n.children.map((c) => renderNode(c, depth + 1)).join("")}</ul></details></li>`
+      : `<li class="leaf">${label(n, q)}</li>`;
   const full = `<ul>${roots.map((r) => renderNode(r, 0)).join("")}</ul>`;
   box.innerHTML = full;
+  status.textContent = "";
+
+  const matches = (n, q) => n.name.toLowerCase().includes(q) || n.acronym.toLowerCase().includes(q);
+
+  /**
+   * Filtered tree: matching regions with their ancestors expanded down to them.
+   * A matching region keeps all its children (collapsed, so they can be opened);
+   * branches containing further matches are expanded.
+   */
+  const renderFiltered = (q) => {
+    const hasMatch = new Map(); // node -> subtree contains a match
+    const flag = (n) => {
+      let any = matches(n, q);
+      for (const c of n.children) any = flag(c) || any;
+      hasMatch.set(n, any);
+      return any;
+    };
+    roots.forEach(flag);
+    let count = 0;
+    const render = (n) => {
+      const self = matches(n, q);
+      if (self) count++;
+      const kids = n.children.filter((c) => hasMatch.get(c));
+      if (!self) {
+        // ancestor of a match: show only the branches leading to matches, expanded
+        return `<li><details open><summary>${label(n)}</summary><ul>${kids.map(render).join("")}</ul></details></li>`;
+      }
+      if (!n.children.length) return `<li class="leaf hit">${label(n, q)}</li>`;
+      const children = n.children.map((c) => (hasMatch.get(c) ? render(c) : renderNode(c, 1))).join("");
+      return `<li class="hit"><details ${kids.length ? "open" : ""}><summary>${label(n, q)}</summary><ul>${children}</ul></details></li>`;
+    };
+    const html = roots.filter((r) => hasMatch.get(r)).map(render).join("");
+    return { html: html ? `<ul>${html}</ul>` : "", count };
+  };
+
+  let timer;
   input.addEventListener("input", () => {
-    const q = input.value.trim().toLowerCase();
-    if (!q) {
-      box.innerHTML = full;
-      return;
-    }
-    const hits = rows.filter((r) => r.name.toLowerCase().includes(q) || r.acronym.toLowerCase().includes(q)).slice(0, 300);
-    box.innerHTML = hits.length
-      ? `<ul>${hits.map((r) => `<li class="leaf">${label(r)}</li>`).join("")}</ul>`
-      : `<p class="muted">No matching regions.</p>`;
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const q = input.value.trim().toLowerCase();
+      if (!q) {
+        box.innerHTML = full;
+        status.textContent = "";
+        return;
+      }
+      const { html, count } = renderFiltered(q);
+      box.innerHTML = html || `<p class="muted">No matching regions.</p>`;
+      status.textContent = count ? `${count} matching region${count === 1 ? "" : "s"}` : "";
+    }, 120);
   });
 }
 

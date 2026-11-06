@@ -32,6 +32,7 @@ scripts/build_index.py   crawl s3://brainglobe/atlas -> public/data/index.json
                          (+ public/data/terminologies/*.json)
 src/search.js            query parsing, ranking, facets
 src/neuroglancer.js      neuroglancer links (published state files)
+src/slice.js             coronal section previews
 src/export/formats.js    TIFF/BigTIFF, NIfTI-1 and NRRD header writers
 src/export/zip.js        streaming ZIP64 writer (for OME-Zarr)
 src/export/export.js     stream zarr chunks -> planes -> file
@@ -45,7 +46,14 @@ metadata of each template/annotation/hemisphere store, every `terminology.csv`, 
 descriptions on the [atlas details](https://brainglobe.info/documentation/brainglobe-atlasapi/usage/atlas-details.html)
 documentation page. It also samples each template to set a sensible neuroglancer contrast range.
 It needs only the Python standard library (plus optional `numpy` and `zstandard` for contrast
-ranges).
+ranges and previews).
+
+Each atlas page shows a coronal section of the template and annotation. Because zarr chunks are
+3D, reading even one plane means downloading every chunk it crosses (hundreds of MB for atlases
+stored at a single resolution), so the builder reads each plane once and writes a small preview
+(`public/data/previews/*.json`, ~20–120 KB: a contrast-scaled template plane and the annotation
+labels). Previews are named after the store versions; existing ones are reused, and CI caches
+them between runs.
 
 ### Coordinate conventions
 
@@ -82,5 +90,5 @@ npm run test:e2e  # export a real atlas from S3 with the site's code, compare to
 automatically), runs the tests, and publishes `dist/` to GitHub Pages. The site uses relative
 paths, so it can be hosted under any sub-path or on any static host.
 
-The neuroglancer instance defaults to `https://neuroglancer-demo.appspot.com/` and can be
-changed on any atlas page (stored per browser).
+Atlases open in the public neuroglancer instance at `https://neuroglancer-demo.appspot.com/`
+(`DEFAULT_NEUROGLANCER` in `src/neuroglancer.js`).
