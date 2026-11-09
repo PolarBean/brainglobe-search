@@ -603,6 +603,11 @@ def build(out_dir: Path, docs_path: Path | None, workers: int = 16) -> None:
     for key, version in sorted(manifests, key=lambda kv: (kv[0], version_key(kv[1]))):
         m = manifests[(key, version)]
         name = m.get("name")
+        res = [float(r) for r in m.get("resolution", [])]
+        t_loc = m["template"]["location"]
+        a_loc = m["annotation_set"]["location"]
+        tinfo = templates.get(t_loc) or {}
+        ainfo = annotations.get(a_loc) or {}
         entry = {
             "key": key,
             "name": name,
