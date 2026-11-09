@@ -41,6 +41,7 @@ import json
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -370,6 +371,24 @@ def slug(location: str) -> str:
     return location.strip("/").replace("/", "__")
 
 
+def list_bucket(prefix: str) -> dict[str, str]:
+    """All keys under a prefix with their LastModified time (ISO 8601)."""
+    out: dict[str, str] = {}
+    token = None
+    while True:
+        q = f"list-type=2&prefix={urllib.parse.quote(prefix)}&max-keys=1000"
+        if token:
+            q += f"&continuation-token={urllib.parse.quote(token)}"
+        xml = fetch(f"{BUCKET}/?{q}").decode()
+        for key, mod in re.findall(r"<Key>([^<]+)</Key><LastModified>([^<]+)</LastModified>", xml):
+            out[key] = mod
+        m = re.search(r"<NextContinuationToken>([^<]+)</NextContinuationToken>", xml)
+        if not m:
+            return out
+        token = m.group(1)
+
+
+
 # --------------------------------------------------------------------------
 # Documentation enrichment
 # --------------------------------------------------------------------------
@@ -441,16 +460,27 @@ def build(out_dir: Path, docs_path: Path | None, workers: int = 16) -> None:
     latest = dict(conf["atlases"])
     print(f"{len(latest)} atlases in last_versions.conf", file=sys.stderr)
 
+    # Every published version of those atlases, with its upload time.
+    uploaded: dict[tuple[str, str], str] = {}
+    for k, mod in list_bucket("atlas/atlases/").items():
+        m = re.fullmatch(r"atlas/atlases/([^/]+)/([^/]+)/manifest\.json", k)
+        if m and m.group(1) in latest:
+            uploaded[(m.group(1), m.group(2).replace("_", "."))] = mod
+    for key, version in latest.items():
+        uploaded.setdefault((key, version), None)
+
     def get_manifest(item):
         key, version = item
         vdir = version.replace(".", "_")
         m = fetch_json(f"{ROOT}/atlases/{key}/{vdir}/manifest.json")
         if m is None:
             print(f"  ! missing manifest for {key} {version}", file=sys.stderr)
-        return key, m
+        return item, m
 
     with ThreadPoolExecutor(workers) as ex:
-        manifests = {k: m for k, m in ex.map(get_manifest, latest.items()) if m}
+        manifests = {k: m for k, m in ex.map(get_manifest, sorted(uploaded)) if m}
+    print(f"{len(manifests)} atlas versions", file=sys.stderr)
+
 
     template_locs = {m["template"]["location"] for m in manifests.values()}
     annot_locs = {m["annotation_set"]["location"] for m in manifests.values()}
@@ -563,21 +593,22 @@ def build(out_dir: Path, docs_path: Path | None, workers: int = 16) -> None:
     else:
         raw = fetch(DOCS_URL)
         md = raw.decode() if raw else None
-    docs = parse_docs(md, set(manifests)) if md else {}
+    docs = parse_docs(md, set(latest)) if md else {}
     print(f"{len(docs)} atlases matched to documentation", file=sys.stderr)
 
+    def version_key(v):
+        return tuple(int(x) for x in re.findall(r"\d+", v))
+
     atlases = []
-    for key in sorted(manifests):
-        m = manifests[key]
-        res = [float(r) for r in m.get("resolution", [])]
-        t_loc = m["template"]["location"]
-        a_loc = m["annotation_set"]["location"]
-        tinfo = templates.get(t_loc) or {}
-        ainfo = annotations.get(a_loc) or {}
+    for key, version in sorted(manifests, key=lambda kv: (kv[0], version_key(kv[1]))):
+        m = manifests[(key, version)]
+        name = m.get("name")
         entry = {
             "key": key,
-            "name": m.get("name"),
-            "version": m.get("version"),
+            "name": name,
+            "version": m.get("version") or version,
+            "latest": latest.get(key) == version,
+            "uploaded": uploaded.get((key, version)),
             "species": m.get("species"),
             "citation": m.get("citation"),
             "atlas_link": m.get("atlas_link"),
@@ -588,7 +619,7 @@ def build(out_dir: Path, docs_path: Path | None, workers: int = 16) -> None:
             "additional_references": m.get("additional_references") or [],
             "atlas_packager": m.get("atlas_packager"),
             "coordinate_space": m.get("coordinate_space", {}).get("name"),
-            "manifest": f"/atlases/{key}/{m['version'].replace('.', '_')}/manifest.json",
+            "manifest": f"/atlases/{key}/{version.replace('.', '_')}/manifest.json",
             "template": {
                 **m["template"],
                 "level": match_level(tinfo.get("levels", []), res),

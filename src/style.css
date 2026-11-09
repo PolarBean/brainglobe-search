@@ -299,6 +299,14 @@ input[type="number"], input[type="url"], .text-input, select {
 .dl-table td.size { color: var(--text-muted); font-size: 0.9rem; white-space: nowrap; }
 .atlas-line { margin: 0; display: flex; flex-wrap: wrap; gap: 0.25rem 1.25rem; align-items: baseline; color: var(--text-muted); }
 .actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 1.25rem 0 0; }
+.notice {
+  margin: 0.75rem 0 0;
+  padding: 0.6rem 1rem;
+  border-left: 4px solid var(--primary);
+  border-radius: 0.25rem;
+  background: var(--surface);
+  font-size: 0.9rem;
+}
 section { scroll-margin-top: 5rem; }
 h2 .count { font-size: 1rem; font-weight: 400; color: var(--text-muted); margin-left: 0.25rem; }
 

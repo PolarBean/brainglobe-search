@@ -11,7 +11,8 @@ const jobsEl = document.getElementById("jobs");
 
 let INDEX = null;
 let DOCS = null;
-const BY_KEY = new Map(); // "allen_mouse_25um" -> atlas entry (one resolution)
+const BY_KEY = new Map(); // "allen_mouse_25um" -> latest atlas entry (one resolution)
+const VERSIONS = new Map(); // "allen_mouse_25um" -> entries of every published version, newest first
 const BY_NAME = new Map(); // "allen_mouse" -> {name, family, keys: [atlas entries, finest first]}
 const TERM_CACHE = new Map();
 
@@ -80,11 +81,23 @@ async function copy(text, what = "Copied") {
   }
 }
 
+function compareVersions(a, b) {
+  const x = String(a).split(".").map(Number);
+  const y = String(b).split(".").map(Number);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0);
+  return 0;
+}
+
+const fmtDate = (iso) =>
+  iso ? new Date(iso).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" }) : "";
+
 function familyOf(a) {
   return a.docs?.title || a.name;
 }
 
 const pageHref = (name) => `#/atlas/${encodeURIComponent(name)}`;
+/** Link to one resolution, pinned to its version or following the latest. */
+const versionHref = (a, pinned) => (pinned ? `${pageHref(a.key)}/v${encodeURIComponent(a.version)}` : pageHref(a.key));
 
 function storageGet(k) {
   try {
@@ -140,14 +153,17 @@ function setupThemeToggle() {
 // routing
 // ---------------------------------------------------------------------------
 function route() {
-  const m = /^#\/atlas\/(.+)$/.exec(location.hash);
+  const m = /^#\/atlas\/([^/]+)(?:\/v([^/]+))?$/.exec(location.hash);
   if (m) {
     const id = decodeURIComponent(m[1]);
     if (BY_NAME.has(id)) return renderDetail(BY_NAME.get(id));
-    // old per-resolution links: show the atlas page with that resolution selected
-    // a resolution-specific atlas name selects that resolution on the atlas page
+    // a resolution-specific atlas name selects that resolution on the atlas
+    // page, and /v<version> selects a version of it
     const atlas = BY_KEY.get(id);
-    if (atlas) return renderDetail(BY_NAME.get(atlas.name), atlas);
+    if (atlas) {
+      const version = m[2] && VERSIONS.get(id).find((a) => a.version === decodeURIComponent(m[2]));
+      return renderDetail(BY_NAME.get(atlas.name), version || atlas, Boolean(version));
+    }
   }
   renderSearch();
 }
@@ -481,15 +497,20 @@ const detailOptions = { allLevels: false };
  * single resolution dropdown at the top of the page selects; everything on the
  * page (downloads, code, metadata) follows it.
  */
-function renderDetail(page, selected = null) {
-  const atlas = selected && page.keys.includes(selected) ? selected : page.keys[0];
+function renderDetail(page, selected = null, pinned = false) {
+  const atlas = selected && page.keys.some((a) => a.key === selected.key) ? selected : page.keys[0];
+  const versions = VERSIONS.get(atlas.key);
+  const newest = versions[0];
+  // Unless a version is picked, the page follows the latest version and links
+  // the unversioned neuroglancer state, which BrainGlobe keeps on the latest.
+  if (atlas.latest === false) pinned = true;
   const d = atlas.docs || {};
   const title = familyOf(atlas);
   const ann = INDEX.annotation_sets[atlas.annotation_set.location] || {};
   const term = INDEX.terminologies[atlas.terminology.location];
   const urls = componentUrls(INDEX, atlas);
-  const stateUrl = stateFileUrl(INDEX, page.name);
-  document.title = `${atlas.key} · BrainGlobe atlas search`;
+  const stateUrl = stateFileUrl(INDEX, atlas.name, pinned ? atlas.version : null);
+  document.title = `${atlas.key}${atlas.latest ? "" : ` v${atlas.version}`} · BrainGlobe atlas search`;
   const common = commonName(atlas.species);
   const variants = [...BY_NAME.values()].filter((p) => p.family === page.family).sort((a, b) => byNameNumeric(a.name, b.name));
   const sections = [
@@ -507,7 +528,6 @@ function renderDetail(page, selected = null) {
         <nav class="breadcrumb" aria-label="Breadcrumb"><a href="#/">Atlas search</a><span aria-hidden="true">›</span><span>${esc(title)}</span></nav>
         <h1>${esc(title)}</h1>
         <p class="atlas-line"><span>${common ? `${esc(common)}, ` : ""}<em>${esc(atlas.species)}</em></span>
-          <span>version ${esc(atlas.version)}</span>
           ${variants.length > 1 ? `<span>one of ${variants.length} atlases in this collection</span>` : ""}</p>
 
         <div class="atlas-picker">
@@ -519,15 +539,23 @@ function renderDetail(page, selected = null) {
           <label for="resolution">Resolution</label>
           ${page.keys.length > 1
             ? `<select id="resolution">${page.keys
-                .map((a) => `<option value="${esc(a.key)}" ${a === atlas ? "selected" : ""}>${esc(formatResolution(a))}</option>`)
+                .map((a) => `<option value="${esc(a.key)}" ${a.key === atlas.key ? "selected" : ""}>${esc(formatResolution(a))}</option>`)
                 .join("")}</select>`
             : `<span id="resolution" class="static">${esc(formatResolution(atlas))}</span>`}
+          <label for="version">Version</label>
+          <select id="version">
+            <option value="" ${pinned ? "" : "selected"}>Latest (${esc(newest.version)})</option>
+            ${versions.map((a) => `<option value="${esc(a.version)}" ${pinned && a === atlas ? "selected" : ""}>${esc(a.version)}</option>`).join("")}
+          </select>
           <span class="label" id="key-label">Atlas name</span>
           <div class="copy-field" role="group" aria-labelledby="key-label">
             <code>${esc(atlas.key)}</code>
             <button class="btn small" type="button" data-copy="${esc(atlas.key)}">Copy</button>
           </div>
         </div>
+
+        ${atlas.latest ? "" : `<p class="notice">This is version ${esc(atlas.version)}, uploaded ${esc(fmtDate(atlas.uploaded))}.
+          The latest version is <a href="${esc(versionHref(newest, false))}">${esc(newest.version)}</a>; everything on this page refers to ${esc(atlas.version)}.</p>`}
 
         <div class="actions">
           <a class="btn primary" id="ng-open" href="#" target="_blank" rel="noopener">Open in neuroglancer</a>
@@ -571,9 +599,12 @@ function renderDetail(page, selected = null) {
         <section id="code">
           <h2>Use from code</h2>
           <h3>Python</h3>
-          ${snippet(`from brainglobe_atlasapi import BrainGlobeAtlas\n\natlas = BrainGlobeAtlas("${atlas.key}")\ntemplate = atlas.template        # numpy array (z, y, x)\nannotation = atlas.annotation\nhemispheres = atlas.hemispheres\nprint(atlas.lookup_df)           # brain regions`)}
+          ${snippet(`from brainglobe_atlasapi import BrainGlobeAtlas\n\natlas = BrainGlobeAtlas("${atlas.key}"${pinned ? `, version="${atlas.version}"` : ""})\ntemplate = atlas.template        # numpy array (z, y, x)\nannotation = atlas.annotation\nhemispheres = atlas.hemispheres\nprint(atlas.lookup_df)           # brain regions`)}
           <h3>Command line</h3>
-          ${snippet(`brainglobe install -a ${atlas.key}`)}
+          ${atlas.latest
+            ? snippet(`brainglobe install -a ${atlas.key}`)
+            : `<p class="note">The <code>brainglobe install</code> command only installs the latest version (${esc(newest.version)}).
+                Use the Python API above to get version ${esc(atlas.version)}.</p>`}
         </section>
 
         <section id="metadata">
@@ -581,14 +612,22 @@ function renderDetail(page, selected = null) {
           <table class="meta">
             ${row("Atlas name", `<code>${esc(atlas.key)}</code>`)}
             ${row("Species", `<em>${esc(atlas.species)}</em>`)}
-            ${row("Version", esc(atlas.version))}
+            ${row("Version", `${esc(atlas.version)}${atlas.latest ? " (latest)" : ""}`)}
+            ${atlas.uploaded ? row("Uploaded", esc(fmtDate(atlas.uploaded))) : ""}
             ${row("Resolution", `${esc(atlas.resolution.join(" × "))} µm`)}
             ${row("Shape", `${esc(atlas.shape.join(" × "))} (z, y, x)`)}
             ${row("Orientation", `<code>${esc(atlas.orientation)}</code>`)}
             ${row("Symmetric", atlas.symmetric ? "yes" : "no")}
             ${row("Citation", linkify(atlas.citation))}
             ${row("Atlas link", linkify(atlas.atlas_link))}
-            ${atlas.additional_references.length ? row("References", atlas.additional_references.map(linkify).join("<br>")) : ""}
+            ${atlas.additional_references.length
+              ? row(
+                  "Additional templates",
+                  atlas.additional_references
+                    .map((r) => (typeof r === "string" ? linkify(r) : `<code>${esc(r.name)}</code>${r.version ? ` v${esc(r.version)}` : ""}`))
+                    .join("<br>"),
+                )
+              : ""}
             ${atlas.atlas_packager ? row("Packager", linkify(atlas.atlas_packager)) : ""}
             ${row("Coordinate space", `<code>${esc(atlas.coordinate_space)}</code>`)}
             ${row("Template", `<code>${esc(atlas.template.name)}</code> v${esc(atlas.template.version)}`)}
@@ -596,7 +635,7 @@ function renderDetail(page, selected = null) {
             ${row("Terminology", `<code>${esc(atlas.terminology.name)}</code> v${esc(atlas.terminology.version)}`)}
             ${row("Meshes", ann.meshes ? "yes" : "no")}
             ${row("Manifest", `<a href="${esc(urls.manifest)}">manifest.json</a>`)}
-            ${row("Neuroglancer state", `<a href="${esc(stateUrl)}">${esc(page.name)}.json</a>`)}
+            ${row("Neuroglancer state", `<a href="${esc(stateUrl)}">${esc(decodeURIComponent(stateUrl.split("/").pop()))}</a>`)}
           </table>
         </section>
 
@@ -622,20 +661,29 @@ function renderDetail(page, selected = null) {
   view.querySelector("#variant")?.addEventListener("change", (e) => {
     location.hash = pageHref(e.target.value);
   });
+  // the URL names the selected resolution and version, so links keep them
+  const select = (entry, pin, focus) => {
+    history.replaceState(null, "", versionHref(entry, pin));
+    renderDetail(page, entry, pin);
+    app.querySelector(focus)?.focus();
+  };
   view.querySelector("select#resolution")?.addEventListener("change", (e) => {
-    // the URL names the selected resolution, so links keep it
-    history.replaceState(null, "", pageHref(e.target.value));
-    renderDetail(page, BY_KEY.get(e.target.value));
-    app.querySelector("#resolution")?.focus();
+    // keep the selected version if the new resolution has it
+    const vs = VERSIONS.get(e.target.value);
+    const same = pinned && vs.find((a) => a.version === atlas.version);
+    select(same || vs[0], Boolean(same), "#resolution");
+  });
+  view.querySelector("select#version")?.addEventListener("change", (e) => {
+    const v = e.target.value;
+    select(v ? versions.find((a) => a.version === v) : newest, Boolean(v), "#version");
   });
   view.querySelector("#opt-all-levels").addEventListener("change", (e) => (detailOptions.allLevels = e.target.checked));
   app.replaceChildren(view);
 
   renderDownloads(view, page, atlas);
 
-  const ngOpen = view.querySelector("#ng-open");
   const ngLink = viewerUrl(stateUrl);
-  ngOpen.href = ngLink;
+  view.querySelector("#ng-open").href = ngLink;
   view.querySelector("#ng-copy").addEventListener("click", () => copy(ngLink, "Neuroglancer link copied"));
 
   renderSlice(view, atlas);
@@ -691,7 +739,7 @@ async function renderSlice(view, atlas) {
 
     const shownUm = +(img.level.scale[ap] * 1000).toPrecision(4);
     caption.classList.remove("muted");
-    caption.innerHTML = `<strong>Coronal section ${index} of ${n}</strong> of <code>${esc(atlas.key)}</code>
+    caption.innerHTML = `<strong>Coronal section ${index} of ${n}</strong> of <code>${esc(atlas.key)}</code> version ${esc(atlas.version)}
       (0-based index along the anterior–posterior axis, ${fromAnterior.toFixed(2)} mm from the anterior edge).
       Left: template.${img.labels ? " Right: annotation in the atlas colours over the template." : ""}
       Shown at ${esc(String(shownUm))} µm, viewed from the front, with the
@@ -749,7 +797,7 @@ function renderDownloads(view, page, atlas) {
       btn.addEventListener("click", () => {
         const fmt = btn.dataset.fmt;
         const all = fmt === "ome-zarr" && allLevels.checked;
-        const filename = `${all ? `${page.name}_multiscale` : atlas.key}_${comp.id}${FORMATS[fmt].ext}`;
+        const filename = `${all ? `${page.name}_multiscale` : atlas.key}_v${atlas.version}_${comp.id}${FORMATS[fmt].ext}`;
         // open the save dialog synchronously within the click gesture
         const sinkPromise = openSink(filename, { gzip: sinkGzip(fmt) });
         startJob(filename, (onProgress, signal) =>
@@ -761,7 +809,7 @@ function renderDownloads(view, page, atlas) {
             format: fmt,
             orientation: atlas.orientation,
             filename,
-            description: `BrainGlobe ${atlas.key} ${comp.id}`,
+            description: `BrainGlobe ${atlas.key} v${atlas.version} ${comp.id}`,
             onProgress,
             signal,
             sinkPromise,
@@ -790,7 +838,7 @@ function renderOntologyRow(view, atlas, rows, urls) {
     <button class="btn small" type="button" data-o="json" title="BrainGlobe structures.json (list of structures)">JSON</button>
     <button class="btn small" type="button" data-o="itk" title="ITK-SNAP label description file (labels above 65535 are commented out)">ITK-SNAP</button>
     <button class="btn small" type="button" data-o="ctbl" title="3D Slicer colour table">Slicer</button></div>`;
-  const base = atlas.terminology.name;
+  const base = `${atlas.terminology.name}_v${atlas.terminology.version}`;
   const outputs = {
     csv: [`${base}.csv`, "text/csv", async () => new Uint8Array(await (await fetch(urls.terminology)).arrayBuffer())],
     json: [`${base}_structures.json`, "application/json", () => toStructuresJson(rows)],
@@ -962,6 +1010,15 @@ async function boot() {
       Run <code>python scripts/build_index.py</code> to generate it.</p>`;
     return;
   }
+  // Search and the resolution list cover the latest version of every atlas;
+  // older versions are reached from the version dropdown on its page.
+  const all = INDEX.atlases;
+  INDEX.atlases = all.filter((a) => a.latest !== false);
+  for (const a of all) {
+    if (!VERSIONS.has(a.key)) VERSIONS.set(a.key, []);
+    VERSIONS.get(a.key).push(a);
+  }
+  for (const v of VERSIONS.values()) v.sort((x, y) => compareVersions(y.version, x.version));
   for (const a of INDEX.atlases) {
     BY_KEY.set(a.key, a);
     if (!BY_NAME.has(a.name)) BY_NAME.set(a.name, { name: a.name, family: familyOf(a), keys: [] });

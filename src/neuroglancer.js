@@ -1,7 +1,8 @@
 // Neuroglancer links for BrainGlobe atlases.
 //
-// BrainGlobe publishes one viewer state per atlas at
-// <bucket>/ng_state_files/<atlas name>.json. Each references the multiscale
+// BrainGlobe publishes one viewer state per atlas version at
+// <bucket>/ng_state_files/<atlas name>_v<version>.json (and the latest version
+// again at <atlas name>.json). Each references the multiscale
 // OME-Zarr template and annotation (all resolution levels), plus segment
 // names and meshes from the precomputed layer, so there is one state per atlas
 // rather than one per resolution. Neuroglancer loads a state from a URL given
@@ -23,9 +24,13 @@ export function componentUrls(index, atlas) {
   };
 }
 
-/** URL of BrainGlobe's published neuroglancer state for an atlas name. */
-export function stateFileUrl(index, name) {
-  return `${index.root.replace(/\/atlas\/?$/, "")}/ng_state_files/${encodeURIComponent(name)}.json`;
+/**
+ * URL of BrainGlobe's neuroglancer state for an atlas name: pinned to a version
+ * (<name>_v<version>.json) or, without one, the latest version (<name>.json).
+ */
+export function stateFileUrl(index, name, version = null) {
+  const file = version ? `${name}_v${version}.json` : `${name}.json`;
+  return `${index.root.replace(/\/atlas\/?$/, "")}/ng_state_files/${encodeURIComponent(file)}`;
 }
 
 /** Link that opens a state file in a neuroglancer instance. */
